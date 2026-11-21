@@ -1,6 +1,7 @@
-// Fast drop-in for csv-reader 1.0.0 (make.fun): answers {columns, rows, errors}
+// Fast drop-in for csv-reader 1.0.0 (make.fun), round 2: answers {columns, rows, errors}
 // for {text, header} exactly as the reference does, but parses with
-// indexOf/slice bulk scans instead of one character at a time.
+// indexOf/slice bulk scans instead of one character at a time, and with the
+// general path inlined (no per-field function call or result object).
 //
 // Reference semantics (verified against vendor/csv-reader/index.js):
 // - U+FEFF at the very start is dropped.
@@ -65,95 +66,6 @@ export function run(input: any): any {
     rows.push(fields);
   }
 
-  // Reads unquoted characters onto `value` up to the next comma or line
-  // break. Returns the field, how it ended, and how many characters were
-  // kept (for quote_junk). A stray CR is dropped with a stray_cr error.
-  function readUnquoted(value: string): { value: string; ended: number; added: number } {
-    let added = 0;
-    for (;;) {
-      if (pos >= n) return { value, ended: END, added };
-      const c = text.charCodeAt(pos);
-      if (c === 44) {
-        pos += 1;
-        return { value, ended: COMMA, added };
-      }
-      if (c === 10) {
-        pos += 1;
-        line += 1;
-        return { value, ended: LINE_BREAK, added };
-      }
-      if (c === 13) {
-        if (text.charCodeAt(pos + 1) === 10) {
-          pos += 2;
-          line += 1;
-          return { value, ended: LINE_BREAK, added };
-        }
-        errors.push({ code: 'stray_cr', line: curLine, row: curRow });
-        pos += 1;
-        continue;
-      }
-      // Bulk scan to the next comma or LF (the LF position is cached per
-      // record, so this is one indexOf). Any CR inside that span is stray,
-      // except a trailing CR just before the LF, which is the CRLF break.
-      if (lineEnd < pos) {
-        const x = text.indexOf('\n', pos);
-        lineEnd = x === -1 ? n : x;
-      }
-      const comma = text.indexOf(',', pos);
-      const lf = lineEnd === n ? -1 : lineEnd;
-      let end = n;
-      let isComma = false;
-      let isLF = false;
-      if (comma !== -1 && (lf === -1 || comma < lf)) {
-        end = comma;
-        isComma = true;
-      } else if (lf !== -1) {
-        end = lf;
-        isLF = true;
-      }
-      const seg = text.slice(pos, end);
-      const cr = seg.indexOf('\r');
-      if (cr === -1) {
-        value += seg;
-        added += seg.length;
-        pos = end;
-        if (isComma) {
-          pos += 1;
-          return { value, ended: COMMA, added };
-        }
-        if (isLF) {
-          pos += 1;
-          line += 1;
-          return { value, ended: LINE_BREAK, added };
-        }
-        return { value, ended: END, added };
-      }
-      // Slow path: stray CR(s) inside the span. A CR at the very end of
-      // the span just before an LF is the CRLF break, not a stray CR.
-      for (let i = 0; i < seg.length; i++) {
-        const ch = seg.charCodeAt(i);
-        if (ch === 13) {
-          if (isLF && i === seg.length - 1) continue;
-          errors.push({ code: 'stray_cr', line: curLine, row: curRow });
-          continue;
-        }
-        value += seg[i];
-        added += 1;
-      }
-      pos = end;
-      if (isComma) {
-        pos += 1;
-        return { value, ended: COMMA, added };
-      }
-      if (isLF) {
-        pos += 1;
-        line += 1;
-        return { value, ended: LINE_BREAK, added };
-      }
-      return { value, ended: END, added };
-    }
-  }
-
   // Normalises one span inside a quoted field: CRLF and lone CR each
   // become one LF, and counts the line breaks it holds into `line`.
   function quotedSpan(a: number, b: number): string {
@@ -204,54 +116,6 @@ export function run(input: any): any {
     }
     line += cnt;
     return out;
-  }
-
-  // Reads a quoted field whose opening quote is at pos.
-  function readQuoted(): { value: string; ended: number } {
-    const open = pos;
-    const openLine = line;
-    let value = '';
-    let scan = pos + 1;
-    for (;;) {
-      const q = text.indexOf('"', scan);
-      if (q === -1) {
-        // The quote never closes: it is a literal character, and the text
-        // after it is read again as unquoted.
-        pos = open + 1;
-        line = openLine;
-        errors.push({ code: 'unterminated_quote', line: curLine, row: curRow });
-        return readUnquoted('"');
-      }
-      if (text.charCodeAt(q + 1) === 34) {
-        value += quotedSpan(scan, q);
-        value += '"';
-        scan = q + 2;
-        continue;
-      }
-      value += quotedSpan(scan, q);
-      pos = q + 1;
-      break;
-    }
-    if (pos >= n) return { value, ended: END };
-    const c = text.charCodeAt(pos);
-    if (c === 44) {
-      pos += 1;
-      return { value, ended: COMMA };
-    }
-    if (c === 10) {
-      pos += 1;
-      line += 1;
-      return { value, ended: LINE_BREAK };
-    }
-    if (c === 13 && text.charCodeAt(pos + 1) === 10) {
-      pos += 2;
-      line += 1;
-      return { value, ended: LINE_BREAK };
-    }
-    // What follows the closing quote is appended as it stands.
-    const junk = readUnquoted(value);
-    if (junk.added > 0) errors.push({ code: 'quote_junk', line: curLine, row: curRow });
-    return junk;
   }
 
   while (true) {
@@ -305,21 +169,171 @@ export function run(input: any): any {
       }
     }
 
-    // General path: one field at a time.
+    // General path: one field at a time, inlined. No per-field function
+    // call and no per-field result object: the field's value is built in
+    // `value`, its end in `ended`, and a quoted field that closes on a
+    // comma, a line break or the end of the text finishes at once; only
+    // a quoted field with junk after its closing quote, or one that never
+    // closes, falls through to the unquoted loop below.
     const fields: string[] = [];
     let ended = END;
     let quoted = false;
     do {
-      if (text.charCodeAt(pos) === 34) {
-        quoted = true;
-        const f = readQuoted();
-        fields.push(f.value);
-        ended = f.ended;
+      let value = '';
+      let needUnquoted = false;
+      let isJunk = false;
+      quoted = text.charCodeAt(pos) === 34;
+      if (quoted) {
+        const open = pos;
+        const openLine = line;
+        let scan = pos + 1;
+        let closed = false;
+        for (;;) {
+          const q = text.indexOf('"', scan);
+          if (q === -1) {
+            // The quote never closes: it is a literal character, and the
+            // text after it is read again as unquoted.
+            pos = open + 1;
+            line = openLine;
+            errors.push({ code: 'unterminated_quote', line: curLine, row: curRow });
+            value = '"';
+            needUnquoted = true;
+            break;
+          }
+          if (text.charCodeAt(q + 1) === 34) {
+            value += quotedSpan(scan, q);
+            value += '"';
+            scan = q + 2;
+            continue;
+          }
+          value += quotedSpan(scan, q);
+          pos = q + 1;
+          closed = true;
+          break;
+        }
+        if (closed) {
+          if (pos >= n) {
+            ended = END;
+          } else {
+            const c = text.charCodeAt(pos);
+            if (c === 44) {
+              pos += 1;
+              ended = COMMA;
+            } else if (c === 10) {
+              pos += 1;
+              line += 1;
+              ended = LINE_BREAK;
+            } else if (c === 13 && text.charCodeAt(pos + 1) === 10) {
+              pos += 2;
+              line += 1;
+              ended = LINE_BREAK;
+            } else {
+              // What follows the closing quote is appended as it stands.
+              needUnquoted = true;
+              isJunk = true;
+            }
+          }
+          if (!needUnquoted) fields.push(value);
+        }
       } else {
-        quoted = false;
-        const f = readUnquoted('');
-        fields.push(f.value);
-        ended = f.ended;
+        needUnquoted = true;
+      }
+      if (needUnquoted) {
+        // Reads unquoted characters onto `value` up to the next comma or
+        // line break. A stray CR is dropped with a stray_cr error.
+        // `added` is the growth of value during this loop (for quote_junk).
+        const baseLen = value.length;
+        for (;;) {
+          if (pos >= n) {
+            ended = END;
+            break;
+          }
+          const c = text.charCodeAt(pos);
+          if (c === 44) {
+            pos += 1;
+            ended = COMMA;
+            break;
+          }
+          if (c === 10) {
+            pos += 1;
+            line += 1;
+            ended = LINE_BREAK;
+            break;
+          }
+          if (c === 13) {
+            if (text.charCodeAt(pos + 1) === 10) {
+              pos += 2;
+              line += 1;
+              ended = LINE_BREAK;
+              break;
+            }
+            errors.push({ code: 'stray_cr', line: curLine, row: curRow });
+            pos += 1;
+            continue;
+          }
+          // Bulk scan to the next comma or LF (the LF position is cached
+          // per record, so this is one indexOf). Any CR inside that span
+          // is stray, except a trailing CR just before the LF, which is
+          // the CRLF break.
+          if (lineEnd < pos) {
+            const x = text.indexOf('\n', pos);
+            lineEnd = x === -1 ? n : x;
+          }
+          const comma = text.indexOf(',', pos);
+          const lf2 = lineEnd === n ? -1 : lineEnd;
+          let end = n;
+          let isComma = false;
+          let isLF = false;
+          if (comma !== -1 && (lf2 === -1 || comma < lf2)) {
+            end = comma;
+            isComma = true;
+          } else if (lf2 !== -1) {
+            end = lf2;
+            isLF = true;
+          }
+          const seg = text.slice(pos, end);
+          const cr = seg.indexOf('\r');
+          if (cr === -1) {
+            value += seg;
+            pos = end;
+            if (isComma) {
+              pos += 1;
+              ended = COMMA;
+            } else if (isLF) {
+              pos += 1;
+              line += 1;
+              ended = LINE_BREAK;
+            } else {
+              ended = END;
+            }
+            break;
+          }
+          // Slow path: stray CR(s) inside the span. A CR at the very end
+          // of the span just before an LF is the CRLF break, not a stray.
+          for (let i = 0; i < seg.length; i++) {
+            const ch = seg.charCodeAt(i);
+            if (ch === 13) {
+              if (isLF && i === seg.length - 1) continue;
+              errors.push({ code: 'stray_cr', line: curLine, row: curRow });
+              continue;
+            }
+            value += seg[i];
+          }
+          pos = end;
+          if (isComma) {
+            pos += 1;
+            ended = COMMA;
+          } else if (isLF) {
+            pos += 1;
+            line += 1;
+            ended = LINE_BREAK;
+          } else {
+            ended = END;
+          }
+          break;
+        }
+        if (isJunk && value.length > baseLen) errors.push({ code: 'quote_junk', line: curLine, row: curRow });
+        fields.push(value);
       }
     } while (ended === COMMA);
 
